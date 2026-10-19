@@ -1,4 +1,4 @@
-name: Opire & Stealth Bounty Runner
+name: Opire & Algora Stealth Bounty Runner
 on:
   schedule:
     - cron: '*/30 * * * *'
@@ -20,7 +20,7 @@ jobs:
         run: |
           pip install requests pygithub pydantic pytest
 
-      - name: Run Cloud Worker
+      - name: Run Cloud Worker (Stealth & Quality)
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           SOLANA_WALLET: ${{ secrets.SOLANA_WALLET }}
@@ -30,11 +30,12 @@ jobs:
         run: |
           python runner.py || true
 
-      - name: Run Opire Solver Engine
+      - name: Run Bounty Solver Engine (Algora & Opire + LLM)
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          TELEGRAM_BOT_TOKEN: "8693469191:AAEaEszFTAibl8bUAnkqe9hDN3-p4DMB8A0"
+          TELEGRAM_BOT_TOKEN: "8693469191:***"
           TELEGRAM_CHAT_ID: "7572064021"
           WORKER_ID: ${{ secrets.WORKER_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python opire_solver.py || true
