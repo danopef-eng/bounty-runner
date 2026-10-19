@@ -25,6 +25,10 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
 MAX_OPEN_PRS = 4
 CENTRAL_CLAIMS_URL = "https://raw.githubusercontent.com/gangkor/hermes-core/main/bounty_shared_claims.json"
+CENTRAL_NOTIFIED_COMMENTS_URL = "https://raw.githubusercontent.com/gangkor/hermes-core/main/notified_comments.json"
+LOCAL_NOTIFIED_COMMENTS_FILE = "notified_comments.json"
+FALLBACK_PROCESSED_COMMENT_IDS = {6270746920, 6271230948}
+
 
 STOP_WORDS = [
     "radar", "aggregator", "crawler", "benchmark", "test-bot",
@@ -154,9 +158,84 @@ def is_bounty_eligible(issue_data: dict) -> bool:
             return True
     return False
 
+def get_notified_comment_ids() -> set:
+    """Load processed comment IDs from local file or central repo, with hardcoded fallbacks."""
+    processed = set(FALLBACK_PROCESSED_COMMENT_IDS)
+    if os.path.exists(LOCAL_NOTIFIED_COMMENTS_FILE):
+        try:
+            with open(LOCAL_NOTIFIED_COMMENTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                processed.update(data.get("processed_comment_ids", []))
+        except Exception as e:
+            log(f"Notice: could not read local {LOCAL_NOTIFIED_COMMENTS_FILE}: {e}")
+    try:
+        req = urllib.request.Request(CENTRAL_NOTIFIED_COMMENTS_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            processed.update(data.get("processed_comment_ids", []))
+    except Exception as e:
+        log(f"Notice: could not fetch central notified comments: {e}")
+    return processed
+
+def record_notified_comment_id(comment_id: int):
+    """Persist notified comment ID locally and sync to gangkor/hermes-core."""
+    local_data = {"version": "1.0.0", "processed_comment_ids": [], "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if os.path.exists(LOCAL_NOTIFIED_COMMENTS_FILE):
+        try:
+            with open(LOCAL_NOTIFIED_COMMENTS_FILE, "r", encoding="utf-8") as f:
+                local_data = json.load(f)
+        except Exception:
+            pass
+    ids = set(local_data.get("processed_comment_ids", []))
+    ids.add(comment_id)
+    local_data["processed_comment_ids"] = sorted(list(ids))
+    local_data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with open(LOCAL_NOTIFIED_COMMENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(local_data, f, indent=2)
+    except Exception as e:
+        log(f"Notice: could not save local {LOCAL_NOTIFIED_COMMENTS_FILE}: {e}")
+
+    # Sync to gangkor/hermes-core
+    try:
+        get_url = "https://api.github.com/repos/gangkor/hermes-core/contents/notified_comments.json"
+        req = urllib.request.Request(get_url, headers={"Authorization": f"Bearer {GH_PAT}", "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res_data = json.loads(resp.read().decode())
+            sha = res_data["sha"]
+            remote_json = json.loads(base64.b64decode(res_data["content"]).decode())
+
+        remote_ids = set(remote_json.get("processed_comment_ids", []))
+        remote_ids.add(comment_id)
+        remote_json["processed_comment_ids"] = sorted(list(remote_ids))
+        remote_json["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        b64_content = base64.b64encode(json.dumps(remote_json, indent=2).encode()).decode()
+        put_data = json.dumps({
+            "message": f"chore: track notified comment {comment_id} by {WORKER_ID}",
+            "content": b64_content,
+            "sha": sha
+        }).encode()
+        put_req = urllib.request.Request(get_url, data=put_data, headers={"Authorization": f"Bearer {GH_PAT}", "User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}, method="PUT")
+        with urllib.request.urlopen(put_req, timeout=15) as resp:
+            log(f"Comment {comment_id} tracked in hermes-core (status {resp.status})")
+    except Exception as e:
+        log(f"Notice: could not sync notified comment {comment_id} to hermes-core: {e}")
+
+def get_pr_latest_commit_date(repo_parts: str, pr_number: int) -> str:
+    """Get ISO date string of latest commit in PR."""
+    try:
+        commits = gh_request(f"repos/{repo_parts}/pulls/{pr_number}/commits")
+        if isinstance(commits, list) and len(commits) > 0:
+            return commits[-1].get("commit", {}).get("committer", {}).get("date", "")
+    except Exception as e:
+        log(f"Error fetching PR #{pr_number} commits: {e}")
+    return ""
+
 def monitor_reviews_and_comments():
     """Check active PRs for maintainer comments or requested changes and notify Telegram."""
     log("Checking active PRs for maintainer reviews/comments...")
+    processed_comments = get_notified_comment_ids()
     prs = gh_request(f"search/issues?q=author:{GH_USER}+type:pr+state:open")
     for pr_item in prs.get("items", [])[:MAX_OPEN_PRS]:
         pr_number = pr_item.get("number")
@@ -165,24 +244,41 @@ def monitor_reviews_and_comments():
         if not repo_parts:
             continue
 
+        latest_commit_date = get_pr_latest_commit_date(repo_parts, pr_number)
         comments = gh_request(f"repos/{repo_parts}/issues/{pr_number}/comments")
         if isinstance(comments, list):
             for c in comments:
+                cid = c.get("id")
+                if cid in processed_comments:
+                    log(f"Skipping comment {cid} (already processed/notified).")
+                    continue
+
                 author = c.get("user", {}).get("login", "")
                 if author and author.lower() != GH_USER.lower() and "[bot]" not in author.lower():
                     comment_body = c.get("body", "")
                     comment_url = c.get("html_url", "")
                     created_at = c.get("created_at", "")
-                    log(f"Found maintainer comment on {repo_parts}#{pr_number} by {author}")
+
+                    # Verify that comment is newer than the latest commit in PR
+                    if latest_commit_date and created_at and created_at < latest_commit_date:
+                        log(f"Skipping stale comment {cid} created at {created_at} before latest commit {latest_commit_date}")
+                        record_notified_comment_id(cid)
+                        processed_comments.add(cid)
+                        continue
+
+                    log(f"Found NEW maintainer comment {cid} on {repo_parts}#{pr_number} by {author}")
                     # Notify telegram
-                    send_telegram(
-                        f"💬 *[{WORKER_ID} {GH_USER}] Коментар від мейнтейнера!*\n\n"
+                    sent = send_telegram(
+                        f"💬 *[{WORKER_ID} {GH_USER}] Новий коментар від мейнтейнера!*\n\n"
                         f"📦 *Репозиторій:* `{repo_parts}`\n"
                         f"🔢 *PR:* #{pr_number}\n"
                         f"👤 *Автор:* @{author}\n"
                         f"📝 *Коментар:* {comment_body[:300]}...\n\n"
                         f"🔗 {comment_url}"
                     )
+                    if sent:
+                        record_notified_comment_id(cid)
+                        processed_comments.add(cid)
                     break
 
 def run_local_repo_tests(repo_dir: str) -> bool:
