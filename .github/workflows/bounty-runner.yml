@@ -33,8 +33,8 @@ jobs:
       - name: Run Bounty Solver Engine (Algora & Opire + LLM)
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          TELEGRAM_BOT_TOKEN: "8693469191:***"
-          TELEGRAM_CHAT_ID: "7572064021"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WORKER_ID: ${{ secrets.WORKER_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PAYOUT_WALLET_SOL: ${{ secrets.PAYOUT_WALLET_SOL }}
