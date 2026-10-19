@@ -1,0 +1,26 @@
+name: Bounty Runner Cloud
+on:
+  schedule:
+    - cron: '*/35 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Cloud Worker
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          SOLANA_WALLET: ${{ secrets.SOLANA_WALLET }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          WORKER_ID: ${{ secrets.WORKER_ID }}
+        run: python runner.py
