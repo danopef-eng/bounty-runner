@@ -1,14 +1,14 @@
-name: Bounty Runner Cloud
+name: Opire & Stealth Bounty Runner
 on:
   schedule:
-    - cron: '*/35 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
-  run-worker:
+  run-agent:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -16,8 +16,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Test Tooling
-        run: pip install --quiet pytest
+      - name: Install Dependencies
+        run: |
+          pip install requests pygithub pydantic pytest
 
       - name: Run Cloud Worker
         env:
@@ -26,4 +27,14 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           WORKER_ID: ${{ secrets.WORKER_ID }}
-        run: python runner.py
+        run: |
+          python runner.py || true
+
+      - name: Run Opire Solver Engine
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          TELEGRAM_BOT_TOKEN: "8693469191:AAEaEszFTAibl8bUAnkqe9hDN3-p4DMB8A0"
+          TELEGRAM_CHAT_ID: "7572064021"
+          WORKER_ID: ${{ secrets.WORKER_ID }}
+        run: |
+          python opire_solver.py || true
