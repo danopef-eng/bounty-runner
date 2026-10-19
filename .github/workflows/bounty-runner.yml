@@ -37,5 +37,8 @@ jobs:
           TELEGRAM_CHAT_ID: "7572064021"
           WORKER_ID: ${{ secrets.WORKER_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PAYOUT_WALLET_SOL: ${{ secrets.PAYOUT_WALLET_SOL }}
+          PAYOUT_WALLET_EVM: ${{ secrets.PAYOUT_WALLET_EVM }}
+          PAYOUT_EMAIL: ${{ secrets.PAYOUT_EMAIL }}
         run: |
           python opire_solver.py || true
