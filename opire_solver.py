@@ -16,8 +16,9 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.error
+import ast
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8693469191:***")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8693469191:AAEaEszFTAibl8bUAnkqe9hDN3-p4DMB8A0")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7572064021")
 GITHUB_TOKEN = os.getenv("GH_TOKEN") or os.getenv("GH_PAT")
 WORKER_ID = os.getenv("WORKER_ID", "Worker")
@@ -26,6 +27,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 PAYOUT_WALLET_SOL = os.getenv("PAYOUT_WALLET_SOL") or os.getenv("SOLANA_WALLET", "")
 PAYOUT_EMAIL = os.getenv("PAYOUT_EMAIL", "")
 CENTRAL_CLAIMS_URL = "https://raw.githubusercontent.com/gangkor/hermes-core/main/bounty_shared_claims.json"
+FALLBACK_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry_fallback.log")
 
 STOP_WORDS = [
     "radar", "aggregator", "crawler", "benchmark", "test-bot",
@@ -35,6 +37,29 @@ STOP_WORDS = [
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{WORKER_ID}] {msg}", flush=True)
+
+def check_telegram_token() -> bool:
+    """Validate Telegram Bot Token via getMe before attempting operations."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("ok"):
+                return True
+    except urllib.error.HTTPError as e:
+        msg = f"[WARNING] Telegram Bot Token invalid (HTTP {e.code}). Check BotFather / token settings."
+        log(msg)
+        try:
+            with open(FALLBACK_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"Telegram healthcheck error: {e}")
+    return False
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -55,7 +80,13 @@ def send_telegram(text: str):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
     except Exception as e:
-        log(f"Telegram error: {e}")
+        fallback_msg = f"Telegram error: {e} | Message: {text[:200]}"
+        log(fallback_msg)
+        try:
+            with open(FALLBACK_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {fallback_msg}\n")
+        except Exception:
+            pass
         return False
 
 def gh_api(endpoint: str, method="GET", data=None):
@@ -247,12 +278,65 @@ def search_bounty_candidates():
     log(f"Found {len(valid_candidates)} validated, unclaimed candidate bounties across Opire and Algora.")
     return valid_candidates
 
-def call_gemini_patch_engine(prompt: str) -> str:
+def validate_patch_quality(file_path: str, content: str) -> tuple[bool, str]:
+    """
+    Hard-Quality Gate validator for generated fixes and tests.
+    Strictly forbids dummy placeholders: 'assert True', 'pass', 'return None', '# TODO'.
+    Ensures tests subclass unittest.TestCase or use pytest with substantive logic.
+    """
+    if not content or not content.strip():
+        return False, "Patch content is empty"
+
+    lines = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
+    if len(lines) < 4:
+        return False, f"Patch too trivial (less than 4 lines of substantive code: {len(lines)})"
+
+    forbidden_patterns = [
+        (r"assert\s+True\b", "Forbidden trivial assertion 'assert True'"),
+        (r"^\s*pass\s*$", "Forbidden bare placeholder 'pass'"),
+        (r"return\s+None\b", "Forbidden stub 'return None'"),
+        (r"#\s*TODO\b", "Unfinished stub marker '# TODO' detected"),
+    ]
+    for pattern, reason in forbidden_patterns:
+        if re.search(pattern, content, re.MULTILINE):
+            return False, reason
+
+    if file_path.endswith(".py"):
+        try:
+            tree = ast.parse(content)
+        except SyntaxError as e:
+            return False, f"Python syntax error in patch: {e}"
+
+        is_test_file = "test" in file_path.lower()
+        if is_test_file:
+            has_unittest_class = False
+            has_substantive_test_func = False
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    for base in node.bases:
+                        base_str = ast.unparse(base)
+                        if "TestCase" in base_str or "unittest" in base_str:
+                            has_unittest_class = True
+                elif isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                    if len(node.body) >= 2 or (len(node.body) == 1 and not isinstance(node.body[0], (ast.Pass, ast.Assert))):
+                        has_substantive_test_func = True
+                    elif len(node.body) == 1 and isinstance(node.body[0], ast.Assert):
+                        if not (isinstance(node.body[0].test, ast.Constant) and node.body[0].test.value is True):
+                            has_substantive_test_func = True
+
+            if not (has_unittest_class or has_substantive_test_func):
+                return False, "Test file must subclass unittest.TestCase or define substantive test functions"
+
+    return True, "Quality Gate passed"
+
+def call_gemini_patch_engine(prompt: str, temperature: float = 0.2) -> str:
     """
     Call Google Gemini Flash API to analyze issue and generate clean code diff/patch.
+    Supports temperature adjustment for retries.
     """
     if not GEMINI_API_KEY:
-        log("Notice: GEMINI_API_KEY not set. Using deterministic fallback solver.")
+        log("Notice: GEMINI_API_KEY not set. Cannot run LLM patch engine.")
         return ""
 
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -265,7 +349,7 @@ def call_gemini_patch_engine(prompt: str) -> str:
             }
         ],
         "generationConfig": {
-            "temperature": 0.2,
+            "temperature": temperature,
             "maxOutputTokens": 2048
         }
     }
@@ -346,7 +430,7 @@ def solve_issue_and_create_pr(task: dict):
             if len(repo_files) >= 50:
                 break
 
-        # 4. LLM Gemini Patch Generation or deterministic fallback
+        # 4. LLM Gemini Patch Generation with Quality Gate & Retries
         gemini_prompt = (
             f"You are an expert software engineer fixing an issue in an open-source project.\n\n"
             f"Repository: {repo_parts}\n"
@@ -354,6 +438,10 @@ def solve_issue_and_create_pr(task: dict):
             f"Issue Body:\n{body[:1500]}\n\n"
             f"Recent Comments:\n{comments_text[:1000]}\n\n"
             f"Project Files: {', '.join(repo_files[:40])}\n\n"
+            f"CRITICAL QUALITY RULES:\n"
+            f"- Do NOT produce dummy assertions, 'assert True', 'pass', 'return None', or '# TODO'.\n"
+            f"- If providing/updating tests, write substantive tests inheriting from unittest.TestCase with valid assertions.\n"
+            f"- Write production-ready, complete logic that addresses the issue.\n\n"
             f"Please provide ONLY the exact file modification needed to address this issue.\n"
             f"Output format:\n"
             f"FILE: <path/to/file>\n"
@@ -361,60 +449,54 @@ def solve_issue_and_create_pr(task: dict):
             f"Do not include any chat, reasoning, or markdown backticks outside of the content."
         )
 
-        llm_patch = call_gemini_patch_engine(gemini_prompt)
         modified = False
+        target_file_rel = ""
+        max_attempts = 3
 
-        if llm_patch and "FILE:" in llm_patch and "CONTENT:" in llm_patch:
+        for attempt in range(1, max_attempts + 1):
+            temp = 0.2 if attempt == 1 else (0.4 if attempt == 2 else 0.7)
+            log(f"Generating patch attempt {attempt}/{max_attempts} (temp={temp})...")
+            llm_patch = call_gemini_patch_engine(gemini_prompt, temperature=temp)
+            if not llm_patch or "FILE:" not in llm_patch or "CONTENT:" not in llm_patch:
+                log(f"Attempt {attempt}: Invalid LLM patch format.")
+                continue
+
             try:
                 parts = llm_patch.split("CONTENT:")
                 target_file_rel = parts[0].replace("FILE:", "").strip().splitlines()[0].strip()
                 new_file_content = parts[1].strip()
-                # Clean markdown codeblocks if LLM returned them
                 if new_file_content.startswith("```"):
                     new_file_content = re.sub(r"^```[a-zA-Z]*\n", "", new_file_content)
                     new_file_content = re.sub(r"\n```$", "", new_file_content)
+
+                # Pre-flight Quality Gate
+                is_valid, qg_reason = validate_patch_quality(target_file_rel, new_file_content)
+                if not is_valid:
+                    log(f"Quality Gate rejected patch (Attempt {attempt}): {qg_reason}")
+                    gemini_prompt += f"\n\nPrevious attempt was rejected by Quality Gate: {qg_reason}. Please provide substantive, working code."
+                    continue
 
                 full_target_path = os.path.join(work_dir, target_file_rel)
                 os.makedirs(os.path.dirname(full_target_path), exist_ok=True)
                 with open(full_target_path, "w", encoding="utf-8") as f:
                     f.write(new_file_content)
+
+                # Syntax check for Python
+                if target_file_rel.endswith(".py"):
+                    chk = subprocess.run([sys.executable, "-m", "py_compile", full_target_path], capture_output=True, text=True)
+                    if chk.returncode != 0:
+                        log(f"Syntax check failed (Attempt {attempt}): {chk.stderr.strip()[:100]}")
+                        os.remove(full_target_path)
+                        continue
+
                 modified = True
-                log(f"Successfully applied Gemini Flash patch to {target_file_rel}")
+                log(f"Successfully applied verified patch to {target_file_rel} (Quality Gate PASSED)")
+                break
             except Exception as e:
-                log(f"Failed applying LLM patch: {e}")
-
-        # Deterministic regression verification fallback if no LLM patch applied
-        if not modified:
-            tests_dir = os.path.join(work_dir, "tests")
-            if os.path.exists(tests_dir) and os.path.isdir(tests_dir):
-                test_file = os.path.join(tests_dir, "test_regression.py")
-                unit_code = (
-                    f"\n\ndef test_issue_{issue_num}_verification():\n"
-                    f"    \"\"\"Automated verification for issue #{issue_num}: {title}\"\"\"\n"
-                    f"    assert True\n"
-                )
-                mode = "a" if os.path.exists(test_file) else "w"
-                prefix = "" if os.path.exists(test_file) else "import unittest\n"
-                with open(test_file, mode, encoding="utf-8") as f:
-                    f.write(prefix + unit_code)
-                modified = True
-            else:
-                readme_file = None
-                for cand in ["README.md", "readme.md", "docs/index.md"]:
-                    p = os.path.join(work_dir, cand)
-                    if os.path.exists(p):
-                        readme_file = p
-                        break
-                if readme_file:
-                    with open(readme_file, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    if f"<!-- verified: #{issue_num} -->" not in content:
-                        with open(readme_file, "a", encoding="utf-8") as f:
-                            f.write(f"\n<!-- verified: #{issue_num} -->\n")
-                        modified = True
+                log(f"Failed applying LLM patch on attempt {attempt}: {e}")
 
         if not modified:
-            log("No files could be cleanly modified.")
+            log("ABORT: Quality Gate rejected all generated patches or no valid patch produced. Aborting PR creation to protect repository reputation.")
             return False
 
         # 5. Conventional Commits and PR description standard
