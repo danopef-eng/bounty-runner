@@ -339,35 +339,42 @@ def call_gemini_patch_engine(prompt: str, temperature: float = 0.2) -> str:
         log("Notice: GEMINI_API_KEY not set. Cannot run LLM patch engine.")
         return ""
 
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
+    # Fallback cascade across supported Gemini models
+    models_to_try = ["gemini-flash-latest", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-2.5-pro"]
+    for model_name in models_to_try:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": 2048
             }
-        ],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": 2048
         }
-    }
-    req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "").strip()
-    except Exception as e:
-        log(f"Gemini API request failed: {e}")
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "").strip()
+        except urllib.error.HTTPError as e:
+            log(f"Gemini API request failed for {model_name}: HTTP {e.code} ({e.reason})")
+            continue
+        except Exception as e:
+            log(f"Gemini API request error for {model_name}: {e}")
+            continue
     return ""
 
 def solve_issue_and_create_pr(task: dict):
@@ -525,7 +532,7 @@ def solve_issue_and_create_pr(task: dict):
 
         # 6. Commit and Push
         subprocess.run(["git", "add", "."], cwd=work_dir)
-        subprocess.run(["git", "commit", "-m", commit_msg], cwd=work_dir)
+        subprocess.run(["git", "commit", "-s", "-m", commit_msg], cwd=work_dir)
         push_res = subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=work_dir, capture_output=True, text=True)
         if push_res.returncode != 0:
             log(f"Push error: {push_res.stderr}")
