@@ -23,6 +23,8 @@ GITHUB_TOKEN = os.getenv("GH_TOKEN") or os.getenv("GH_PAT")
 WORKER_ID = os.getenv("WORKER_ID", "Worker")
 GH_USER = os.getenv("GITHUB_REPOSITORY_OWNER") or os.getenv("GH_USER", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+PAYOUT_WALLET_SOL = os.getenv("PAYOUT_WALLET_SOL") or os.getenv("SOLANA_WALLET", "")
+PAYOUT_EMAIL = os.getenv("PAYOUT_EMAIL", "")
 CENTRAL_CLAIMS_URL = "https://raw.githubusercontent.com/gangkor/hermes-core/main/bounty_shared_claims.json"
 
 STOP_WORDS = [
@@ -424,6 +426,11 @@ def solve_issue_and_create_pr(task: dict):
         else:
             close_keyword = f"Resolves #{issue_num}"
 
+        # Construct payout metadata footer
+        payout_meta = ""
+        if PAYOUT_WALLET_SOL:
+            payout_meta += f"\n\n<!-- payout_metadata: solana={PAYOUT_WALLET_SOL} worker={GH_USER} -->\n> Payout Solana: `{PAYOUT_WALLET_SOL[:4]}...{PAYOUT_WALLET_SOL[-4:]}`"
+
         pr_body_desc = (
             f"## Description\n"
             f"Addresses and closes issue #{issue_num} ({title}).\n\n"
@@ -431,6 +438,7 @@ def solve_issue_and_create_pr(task: dict):
             f"- Implemented verified fix and regression safeguards for issue #{issue_num}.\n"
             f"- Validated codebase consistency, logic constraints, and formatting.\n\n"
             f"{close_keyword}"
+            f"{payout_meta}\n"
         )
 
         # 6. Commit and Push
@@ -456,10 +464,11 @@ def solve_issue_and_create_pr(task: dict):
 
             # Polite intent comment on issue
             comment_url = f"repos/{repo_parts}/issues/{issue_num}/comments"
+            sol_ref = f" (Worker: {GH_USER} | SOL: {PAYOUT_WALLET_SOL[:4]}...{PAYOUT_WALLET_SOL[-4:]})" if PAYOUT_WALLET_SOL else ""
             if platform == "Opire":
-                intent_msg = f"I've submitted a fix for this issue in PR {pr_url} (Fixes #{issue_num}). Ready for review!"
+                intent_msg = f"I've submitted a fix for this issue in PR {pr_url} (Fixes #{issue_num}). Ready for review!{sol_ref}"
             else:
-                intent_msg = f"/attempt #{issue_num}\n\nSubmitted implementation in PR {pr_url} ({close_keyword}). Ready for review!"
+                intent_msg = f"/attempt #{issue_num}\n\nSubmitted implementation in PR {pr_url} ({close_keyword}). Ready for review!{sol_ref}"
             gh_api(comment_url, method="POST", data={"body": intent_msg})
 
             send_telegram(
