@@ -16,6 +16,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Test Tooling
+        run: pip install --quiet pytest
+
       - name: Run Cloud Worker
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
