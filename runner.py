@@ -260,6 +260,64 @@ def update_central_claims(repo_full_name: str, issue_url: str):
     except Exception as e:
         log(f"Error syncing claim back to hermes-core: {e}")
 
+def audit_and_purge_closed_prs():
+    """
+    Audits central bounty_shared_claims.json:
+    1. Checks status of PRs recorded in active_open_prs.
+    2. Automatically removes closed/merged PRs (state != 'open') to free slots and update registry.
+    3. Releases corresponding repository mutexes if no active PR remains for that repository.
+    """
+    log("Running automated audit and purge of closed PRs in central claims registry...")
+    try:
+        get_url = "https://api.github.com/repos/gangkor/hermes-core/contents/bounty_shared_claims.json"
+        req = urllib.request.Request(get_url, headers={"Authorization": f"Bearer {GH_PAT}", "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            sha = data["sha"]
+            claims = json.loads(base64.b64decode(data["content"]).decode())
+
+        changed = False
+        active_open_prs = claims.get("active_open_prs", {})
+
+        for user, prs in list(active_open_prs.items()):
+            retained = []
+            for item in prs:
+                repo = item.get("repo")
+                pr_num = item.get("pr")
+                if not repo or not pr_num:
+                    continue
+                pr_res = gh_request(f"repos/{repo}/pulls/{pr_num}")
+                state = pr_res.get("state", "open")
+                if state == "closed":
+                    log(f"[Audit] PR #{pr_num} in {repo} for {user} is CLOSED. Purging from registry...")
+                    changed = True
+                    prefix = user.lower().replace("-", "_")
+                    repo_key = f"{prefix}_claimed_repos"
+                    if repo_key in claims and repo in claims[repo_key]:
+                        has_other = any(x.get("repo") == repo and x.get("pr") != pr_num for x in prs)
+                        if not has_other:
+                            claims[repo_key].remove(repo)
+                            log(f"[Audit] Released repo mutex for {repo} from {user}")
+                else:
+                    retained.append(item)
+            active_open_prs[user] = retained
+
+        if changed:
+            claims["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            b64_content = base64.b64encode(json.dumps(claims, indent=2).encode()).decode()
+            put_data = json.dumps({
+                "message": f"chore(audit): purge closed PRs from shared claims registry by {WORKER_ID}",
+                "content": b64_content,
+                "sha": sha
+            }).encode()
+            put_req = urllib.request.Request(get_url, data=put_data, headers={"Authorization": f"Bearer {GH_PAT}", "User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}, method="PUT")
+            with urllib.request.urlopen(put_req, timeout=15) as put_resp:
+                log("Central bounty_shared_claims.json updated with purged PRs (HTTP 200).")
+        else:
+            log("All tracked PRs in claims registry are verified OPEN. No purge needed.")
+    except Exception as e:
+        log(f"Notice: automated claims audit error ({e})")
+
 def is_bounty_eligible(issue_data: dict) -> bool:
     labels = [l.get("name", "").lower() for l in issue_data.get("labels", [])]
     title = issue_data.get("title", "").lower()
@@ -496,6 +554,12 @@ def save_worker_state(state_data: dict):
 
 def run_scout_and_pr():
     log(f"Starting Stealth, Quality & Sharding cycle for {WORKER_ID} ({GH_USER})...")
+
+    # Step 0: Audit & purge closed/merged PRs from central registry
+    try:
+        audit_and_purge_closed_prs()
+    except Exception as e:
+        log(f"Claims audit exception: {e}")
 
     # Step 1: Monitor existing PR comments (Active PRs only)
     try:
