@@ -46,6 +46,11 @@ if not GH_USER or not GH_PAT:
                 pass
 
 MAX_OPEN_PRS = 4
+STATE_FILE = "state.json"
+LIMIT_ALERT_COOLDOWN_SECONDS = 12 * 3600  # Fallback: не частіше 1 разу на 12 годин
+MONITORING_POLL_INTERVAL_MIN = 15 * 60     # 15 хвилин
+MONITORING_POLL_INTERVAL_MAX = 30 * 60     # 30 хвилин
+
 CENTRAL_CLAIMS_URL = "https://raw.githubusercontent.com/gangkor/hermes-core/main/bounty_shared_claims.json"
 CENTRAL_NOTIFIED_COMMENTS_URL = "https://raw.githubusercontent.com/gangkor/hermes-core/main/notified_comments.json"
 LOCAL_NOTIFIED_COMMENTS_FILE = "notified_comments.json"
@@ -461,6 +466,34 @@ def apply_clean_code_fix(repo_dir: str, issue_num: int, title: str) -> tuple[str
     tech_summary = f"Sanitized boundary inputs and updated edge case handling for issue #{issue_num}."
     return commit_msg, tech_summary
 
+def load_worker_state() -> dict:
+    """Loads worker state from local state.json to maintain alert deduplication across runs."""
+    default_state = {
+        "state": "NORMAL",
+        "is_rate_limited": False,
+        "last_limit_alert_ts": 0.0,
+        "last_open_prs": 0,
+        "updated_at": ""
+    }
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    default_state.update(data)
+        except Exception as e:
+            log(f"Notice: could not load {STATE_FILE}: {e}")
+    return default_state
+
+def save_worker_state(state_data: dict):
+    """Persists worker state to local state.json."""
+    state_data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, indent=2)
+    except Exception as e:
+        log(f"Notice: could not save {STATE_FILE}: {e}")
+
 def run_scout_and_pr():
     log(f"Starting Stealth, Quality & Sharding cycle for {WORKER_ID} ({GH_USER})...")
 
@@ -470,17 +503,61 @@ def run_scout_and_pr():
     except Exception as e:
         log(f"Comment monitoring exception: {e}")
 
-    # Step 2: Audit open PR count (Strict limit <= 4)
+    # Step 2: Audit open PR count with State Deduplication & Cooldown
     open_prs = count_open_prs()
     log(f"Currently open PRs for {GH_USER}: {open_prs}/{MAX_OPEN_PRS}")
+    current_time = time.time()
+    worker_state = load_worker_state()
+    prev_rate_limited = worker_state.get("is_rate_limited", False)
+    last_alert_ts = worker_state.get("last_limit_alert_ts", 0.0)
+
     if open_prs >= MAX_OPEN_PRS:
-        log(f"Open PR limit reached ({open_prs} >= {MAX_OPEN_PRS}). Slots full — monitoring reviews.")
-        send_telegram(
-            f"🛡️ *[{WORKER_ID} {GH_USER}] Ліміт PR досягнуто*\n\n"
-            f"Активних відкритих PR: `{open_prs}/{MAX_OPEN_PRS}`.\n"
-            f"Скрипт перейшов у режим моніторингу рев'ю для захисту репутації акаунта."
-        )
-        return
+        worker_state["state"] = "MONITORING_ONLY"
+        worker_state["is_rate_limited"] = True
+        worker_state["last_open_prs"] = open_prs
+
+        time_since_last_alert = current_time - last_alert_ts
+        should_alert = False
+
+        if not prev_rate_limited:
+            # 1. State change: entering limit state strictly once
+            should_alert = True
+            log(f"State transition -> LIMIT REACHED ({open_prs}/{MAX_OPEN_PRS}). Triggering initial alert.")
+        elif time_since_last_alert >= LIMIT_ALERT_COOLDOWN_SECONDS:
+            # 2. Fallback cooldown elapsed (12 hours)
+            should_alert = True
+            log(f"12h fallback cooldown elapsed ({time_since_last_alert:.0f}s >= {LIMIT_ALERT_COOLDOWN_SECONDS}s). Sending reminder alert.")
+        else:
+            hours_left = (LIMIT_ALERT_COOLDOWN_SECONDS - time_since_last_alert) / 3600
+            log(f"Limit state persistent ({open_prs}/{MAX_OPEN_PRS}). Alert suppressed by deduplication (next reminder eligible in {hours_left:.1f}h).")
+
+        if should_alert:
+            send_telegram(
+                f"🛡️ *[{WORKER_ID} {GH_USER}] Ліміт PR досягнуто*\n\n"
+                f"Активних відкритих PR: `{open_prs}/{MAX_OPEN_PRS}`.\n"
+                f"Скрипт перейшов у режим моніторингу рев'ю для захисту репутації акаунта.\n"
+                f"Нові завдання тимчасово призупинено (дедуплікація сповіщень активна)."
+            )
+            worker_state["last_limit_alert_ts"] = current_time
+
+        save_worker_state(worker_state)
+        # Оптимізація частоти моніторингу в режимі очікування: 15-30 хвилин
+        wait_seconds = random.randint(MONITORING_POLL_INTERVAL_MIN, MONITORING_POLL_INTERVAL_MAX)
+        log(f"Monitoring mode active (4/4 PR). Review polling backoff: {wait_seconds // 60}m before next cycle.")
+        return "MONITORING_ONLY"
+    else:
+        # Check if we recovered from rate limited / full slots
+        if prev_rate_limited:
+            log(f"State transition: Slots unlocked! Open PRs decreased to {open_prs}/{MAX_OPEN_PRS}.")
+            send_telegram(
+                f"🟢 *[{WORKER_ID} {GH_USER}] Слоти PR розблоковано!*\n\n"
+                f"Активних відкритих PR: `{open_prs}/{MAX_OPEN_PRS}` (вільних слотів: {MAX_OPEN_PRS - open_prs}).\n"
+                f"Воркер відновив активний пошук нових завдань."
+            )
+            worker_state["is_rate_limited"] = False
+            worker_state["state"] = "NORMAL"
+            worker_state["last_open_prs"] = open_prs
+            save_worker_state(worker_state)
 
     # Step 3: Anti-Spam Jitter (2 - 7 minutes random delay)
     jitter_seconds = random.randint(120, 420)
