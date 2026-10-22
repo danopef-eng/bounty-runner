@@ -49,7 +49,7 @@ if not GH_USER or not GH_PAT:
             except Exception:
                 pass
 
-MAX_OPEN_PRS = 4
+MAX_OPEN_PRS = 8
 STATE_FILE = "state.json"
 LIMIT_ALERT_COOLDOWN_SECONDS = 12 * 3600  # Fallback: не частіше 1 разу на 12 годин
 MONITORING_POLL_INTERVAL_MIN = 15 * 60     # 15 хвилин
@@ -719,7 +719,7 @@ def run_scout_and_pr():
         save_worker_state(worker_state)
         # Оптимізація частоти моніторингу в режимі очікування: 15-30 хвилин
         wait_seconds = random.randint(MONITORING_POLL_INTERVAL_MIN, MONITORING_POLL_INTERVAL_MAX)
-        log(f"Monitoring mode active (4/4 PR). Review polling backoff: {wait_seconds // 60}m before next cycle.")
+        log(f"Monitoring mode active (8/8 PR). Review polling backoff: {wait_seconds // 60}m before next cycle.")
         return "MONITORING_ONLY"
     else:
         # Check if we recovered from rate limited / full slots
